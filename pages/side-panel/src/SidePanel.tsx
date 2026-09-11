@@ -35,7 +35,6 @@ const SidePanel = () => {
   const [favoritePrompts, setFavoritePrompts] = useState<FavoritePrompt[]>([]);
   const [hasConfiguredModels, setHasConfiguredModels] = useState<boolean | null>(null); // null = loading, false = no models, true = has models
   const [isRecording, setIsRecording] = useState(false);
-  const [isProcessingSpeech, setIsProcessingSpeech] = useState(false);
   const [isReplaying, setIsReplaying] = useState(false);
   const [replayEnabled, setReplayEnabled] = useState(false);
   const sessionIdRef = useRef<string | null>(null);
@@ -44,9 +43,9 @@ const SidePanel = () => {
   const heartbeatIntervalRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const setInputTextRef = useRef<((text: string) => void) | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const recordingTimerRef = useRef<number | null>(null);
+  const speechRecognitionRef = useRef<any>(null);
+  const voiceEnabledRef = useRef(false);
+  const voiceRestartTimerRef = useRef<number | null>(null);
 
   // Check for dark mode preference
   useEffect(() => {
@@ -319,20 +318,6 @@ const SidePanel = () => {
           });
           setInputEnabled(true);
           setShowStopButton(false);
-        } else if (message && message.type === 'speech_to_text_result') {
-          // Handle speech-to-text result
-          if (message.text && setInputTextRef.current) {
-            setInputTextRef.current(message.text);
-          }
-          setIsProcessingSpeech(false);
-        } else if (message && message.type === 'speech_to_text_error') {
-          // Handle speech-to-text error
-          appendMessage({
-            actor: Actors.SYSTEM,
-            content: message.error || t('chat_stt_recognitionFailed'),
-            timestamp: Date.now(),
-          });
-          setIsProcessingSpeech(false);
         } else if (message && message.type === 'heartbeat_ack') {
           console.log('Heartbeat acknowledged');
         }
@@ -816,15 +801,22 @@ const SidePanel = () => {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      // Stop recording if active
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
+      // Stop continuous voice recognition when the side panel closes.
+      voiceEnabledRef.current = false;
+
+      if (voiceRestartTimerRef.current) {
+        window.clearTimeout(voiceRestartTimerRef.current);
+        voiceRestartTimerRef.current = null;
       }
-      // Clear recording timer
-      if (recordingTimerRef.current) {
-        clearTimeout(recordingTimerRef.current);
-        recordingTimerRef.current = null;
+
+      try {
+        speechRecognitionRef.current?.abort();
+      } catch (error) {
+        console.warn('Failed to stop speech recognition:', error);
       }
+
+      speechRecognitionRef.current = null;
+      setIsRecording(false);
       stopConnection();
     };
   }, [stopConnection]);
@@ -836,157 +828,167 @@ const SidePanel = () => {
   }, [messages]);
 
   const handleMicClick = async () => {
-    if (isRecording) {
-      // Stop recording
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
+    const speechWindow = window as any;
+    const SpeechRecognitionAPI =
+      speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+
+    if (!SpeechRecognitionAPI) {
+      appendMessage({
+        actor: Actors.SYSTEM,
+        content:
+          'التعرف الصوتي غير متاح في إصدار Chrome الحالي. استخدم Google Chrome المحدث.',
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    // OFF -> stop everything and stay OFF.
+    if (voiceEnabledRef.current) {
+      voiceEnabledRef.current = false;
+
+      if (voiceRestartTimerRef.current) {
+        window.clearTimeout(voiceRestartTimerRef.current);
+        voiceRestartTimerRef.current = null;
       }
-      // Clear the timer
-      if (recordingTimerRef.current) {
-        clearTimeout(recordingTimerRef.current);
-        recordingTimerRef.current = null;
+
+      try {
+        speechRecognitionRef.current?.stop();
+      } catch (error) {
+        console.warn('Failed to stop speech recognition:', error);
       }
+
+      speechRecognitionRef.current = null;
       setIsRecording(false);
       return;
     }
 
     try {
-      // First check if permission is already granted
-      const permissionStatus = await navigator.permissions.query({ name: 'microphone' as PermissionName });
-
-      if (permissionStatus.state === 'denied') {
-        appendMessage({
-          actor: Actors.SYSTEM,
-          content: t('chat_stt_microphone_permissionDenied'),
-          timestamp: Date.now(),
-        });
-        return;
-      }
-
-      // If permission is not granted, open permission page
-      if (permissionStatus.state !== 'granted') {
-        const permissionUrl = chrome.runtime.getURL('permission/index.html');
-
-        // Open permission page in a new window
-        chrome.windows.create(
-          {
-            url: permissionUrl,
-            type: 'popup',
-            width: 500,
-            height: 600,
-          },
-          createdWindow => {
-            if (createdWindow?.id) {
-              // Listen for window close to check permission status
-              chrome.windows.onRemoved.addListener(function onWindowClose(windowId) {
-                if (windowId === createdWindow.id) {
-                  chrome.windows.onRemoved.removeListener(onWindowClose);
-                  // Check permission status after window closes
-                  setTimeout(async () => {
-                    try {
-                      const newPermissionStatus = await navigator.permissions.query({
-                        name: 'microphone' as PermissionName,
-                      });
-                      // Only retry if permission was granted
-                      if (newPermissionStatus.state === 'granted') {
-                        handleMicClick();
-                      }
-                      // If denied or prompt, do nothing - let user manually try again
-                    } catch (error) {
-                      console.error('Failed to check permission status:', error);
-                    }
-                  }, 500);
-                }
-              });
-            }
-          },
-        );
-        return;
-      }
-
-      // Permission granted - proceed with recording
+      // Ask Chrome for microphone permission. We immediately release this
+      // temporary stream; SpeechRecognition owns the actual listening session.
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop());
 
-      // Clear previous audio chunks
-      audioChunksRef.current = [];
+      voiceEnabledRef.current = true;
 
-      // Create MediaRecorder
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
+      const startRecognition = () => {
+        if (!voiceEnabledRef.current) return;
 
-      // Handle data available event
-      mediaRecorder.ondataavailable = event => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+        const recognition = new SpeechRecognitionAPI();
+        speechRecognitionRef.current = recognition;
+
+        recognition.lang = 'ar-EG';
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+
+        recognition.onstart = () => {
+          setIsRecording(true);
+        };
+
+        recognition.onresult = (event: any) => {
+          if (!voiceEnabledRef.current) return;
+
+          let finalText = '';
+
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const result = event.results[i];
+
+            if (result.isFinal) {
+              finalText += result[0].transcript;
+            }
+          }
+
+          finalText = finalText.trim();
+
+          if (!finalText) return;
+
+          console.log('[NanoBrowser Voice] recognized:', finalText);
+
+          // Send the recognized sentence through exactly the same function
+          // used by the normal text input. No Send button and no Enter.
+          void handleSendMessage(finalText);
+        };
+
+        recognition.onerror = (event: any) => {
+          console.warn('[NanoBrowser Voice] recognition error:', event?.error);
+
+          if (!voiceEnabledRef.current) return;
+
+          // These errors should not turn the user's Voice Mode OFF.
+          // onend will restart the recognition session.
+          if (
+            event?.error === 'not-allowed' ||
+            event?.error === 'service-not-allowed'
+          ) {
+            voiceEnabledRef.current = false;
+            setIsRecording(false);
+
+            appendMessage({
+              actor: Actors.SYSTEM,
+              content:
+                'Chrome رفض استخدام الميكروفون. اسمح لـ NanoBrowser باستخدام الميكروفون ثم شغّل الزر مرة أخرى.',
+              timestamp: Date.now(),
+            });
+          }
+        };
+
+        recognition.onend = () => {
+          setIsRecording(false);
+
+          if (!voiceEnabledRef.current) {
+            return;
+          }
+
+          // Chrome may end an individual SpeechRecognition session after
+          // silence or for an internal reason. Voice Mode remains ON, so
+          // create a fresh session automatically.
+          if (voiceRestartTimerRef.current) {
+            window.clearTimeout(voiceRestartTimerRef.current);
+          }
+
+          voiceRestartTimerRef.current = window.setTimeout(() => {
+            voiceRestartTimerRef.current = null;
+
+            if (voiceEnabledRef.current) {
+              startRecognition();
+            }
+          }, 250);
+        };
+
+        try {
+          recognition.start();
+        } catch (error) {
+          console.warn('[NanoBrowser Voice] start failed:', error);
+
+          if (voiceEnabledRef.current) {
+            voiceRestartTimerRef.current = window.setTimeout(() => {
+              voiceRestartTimerRef.current = null;
+
+              if (voiceEnabledRef.current) {
+                startRecognition();
+              }
+            }, 500);
+          }
         }
       };
 
-      // Handle stop event
-      mediaRecorder.onstop = async () => {
-        // Stop all tracks to release microphone
-        stream.getTracks().forEach(track => track.stop());
-
-        if (audioChunksRef.current.length > 0) {
-          // Create audio blob
-          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-
-          // Convert blob to base64
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const base64Audio = reader.result as string;
-
-            // Setup connection if not exists
-            if (!portRef.current) {
-              setupConnection();
-            }
-
-            // Send audio to backend for speech-to-text conversion
-            try {
-              setIsProcessingSpeech(true);
-              portRef.current?.postMessage({
-                type: 'speech_to_text',
-                audio: base64Audio,
-              });
-            } catch (error) {
-              console.error('Failed to send audio for speech-to-text:', error);
-              appendMessage({
-                actor: Actors.SYSTEM,
-                content: t('chat_stt_processingFailed'),
-                timestamp: Date.now(),
-              });
-              setIsRecording(false);
-              setIsProcessingSpeech(false);
-            }
-          };
-          reader.readAsDataURL(audioBlob);
-        }
-      };
-
-      // Set up 2-minute duration limit
-      const maxDuration = 2 * 60 * 1000;
-      recordingTimerRef.current = window.setTimeout(() => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-          mediaRecorderRef.current.stop();
-        }
-        setIsRecording(false);
-        setIsProcessingSpeech(true);
-        recordingTimerRef.current = null;
-      }, maxDuration);
-
-      // Start recording
-      mediaRecorder.start();
-      setIsRecording(true);
+      startRecognition();
     } catch (error) {
+      voiceEnabledRef.current = false;
+      setIsRecording(false);
+
       console.error('Error accessing microphone:', error);
 
-      let errorMessage = t('chat_stt_microphone_accessFailed');
+      let errorMessage = 'تعذر تشغيل الميكروفون.';
+
       if (error instanceof Error) {
         if (error.name === 'NotAllowedError') {
-          errorMessage += t('chat_stt_microphone_grantPermission');
+          errorMessage =
+            'تم رفض صلاحية الميكروفون. اسمح لـ NanoBrowser باستخدام الميكروفون في Chrome.';
         } else if (error.name === 'NotFoundError') {
-          errorMessage += t('chat_stt_microphone_notFound');
+          errorMessage = 'لم يتم العثور على ميكروفون في الجهاز.';
         } else {
-          errorMessage += error.message;
+          errorMessage += ` ${error.message}`;
         }
       }
 
@@ -995,7 +997,6 @@ const SidePanel = () => {
         content: errorMessage,
         timestamp: Date.now(),
       });
-      setIsRecording(false);
     }
   };
 
@@ -1132,7 +1133,6 @@ const SidePanel = () => {
                         onStopTask={handleStopTask}
                         onMicClick={handleMicClick}
                         isRecording={isRecording}
-                        isProcessingSpeech={isProcessingSpeech}
                         disabled={!inputEnabled || isHistoricalSession}
                         showStopButton={showStopButton}
                         setContent={setter => {
@@ -1170,7 +1170,6 @@ const SidePanel = () => {
                       onStopTask={handleStopTask}
                       onMicClick={handleMicClick}
                       isRecording={isRecording}
-                      isProcessingSpeech={isProcessingSpeech}
                       disabled={!inputEnabled || isHistoricalSession}
                       showStopButton={showStopButton}
                       setContent={setter => {
