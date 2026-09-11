@@ -1,20 +1,48 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { FaMicrophone } from 'react-icons/fa';
-import { AiOutlineLoading3Quarters } from 'react-icons/ai';
 import { t } from '@extension/i18n';
 
 interface ChatInputProps {
   onSendMessage: (text: string, displayText?: string) => void;
   onStopTask: () => void;
+
+  /**
+   * Toggles the always-listening voice mode.
+   *
+   * When false:
+   *   microphone is OFF
+   *
+   * When true:
+   *   microphone stays ON and SidePanel keeps
+   *   restarting speech recognition when Chrome
+   *   ends an individual recognition session.
+   */
   onMicClick?: () => void;
+
+  /**
+   * True while the voice mode is enabled and
+   * SpeechRecognition is listening/reconnecting.
+   */
   isRecording?: boolean;
+
+  /**
+   * Kept for compatibility with the existing NanoBrowser
+   * component API.
+   *
+   * The new always-listening implementation does not use
+   * this value to disable the microphone button.
+   */
   isProcessingSpeech?: boolean;
+
   disabled: boolean;
   showStopButton: boolean;
+
   setContent?: (setter: (text: string) => void) => void;
+
   isDarkMode?: boolean;
-  // Historical session ID - if provided, shows replay button instead of send button
+
   historicalSessionId?: string | null;
+
   onReplay?: (sessionId: string) => void;
 }
 
@@ -39,182 +67,363 @@ export default function ChatInput({
   onReplay,
 }: ChatInputProps) {
   const [text, setText] = useState('');
+
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const isSendButtonDisabled = useMemo(
     () => disabled || (text.trim() === '' && attachedFiles.length === 0),
     [disabled, text, attachedFiles],
   );
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Handle text changes and resize textarea
-  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const newText = e.target.value;
-    setText(newText);
-
-    // Resize textarea
+  /*
+   * Resize textarea whenever its content changes.
+   */
+  const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = 'auto';
-      textarea.style.height = `${Math.min(textarea.scrollHeight, 100)}px`;
-    }
-  };
 
-  // Expose a method to set content from outside
-  useEffect(() => {
-    if (setContent) {
-      setContent(setText);
+    if (!textarea) {
+      return;
     }
-  }, [setContent]);
 
-  // Initial resize when component mounts
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = 'auto';
-      textarea.style.height = `${Math.min(textarea.scrollHeight, 100)}px`;
-    }
+    textarea.style.height = 'auto';
+
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 100)}px`;
   }, []);
 
+  /*
+   * Handle text changes.
+   */
+  const handleTextChange = useCallback(
+    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const newText = e.target.value;
+
+      setText(newText);
+
+      resizeTextarea();
+    },
+    [resizeTextarea],
+  );
+
+  /*
+   * Expose a method to set the text from SidePanel.
+   *
+   * The existing NanoBrowser architecture uses this callback,
+   * so we keep it completely compatible.
+   */
+  useEffect(() => {
+    if (!setContent) {
+      return;
+    }
+
+    setContent(setText);
+  }, [setContent]);
+
+  /*
+   * Initial textarea sizing.
+   */
+  useEffect(() => {
+    resizeTextarea();
+  }, [resizeTextarea]);
+
+  /*
+   * Submit a normal typed message.
+   */
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
+
       const trimmedText = text.trim();
 
-      if (trimmedText || attachedFiles.length > 0) {
-        let messageContent = trimmedText;
-        let displayContent = trimmedText;
-
-        // Security: Clearly separate user input from file content
-        // The background service will sanitize file content using guardrails
-        if (attachedFiles.length > 0) {
-          const fileContents = attachedFiles
-            .map(file => {
-              // Tag file content for background service to identify and sanitize
-              return `\n\n<nano_file_content type="file" name="${file.name}">\n${file.content}\n</nano_file_content>`;
-            })
-            .join('\n');
-
-          // Combine user message with tagged file content (for background service)
-          messageContent = trimmedText
-            ? `${trimmedText}\n\n<nano_attached_files>${fileContents}</nano_attached_files>`
-            : `<nano_attached_files>${fileContents}</nano_attached_files>`;
-
-          // Create display version with only filenames (for UI)
-          const fileList = attachedFiles.map(file => `📎 ${file.name}`).join('\n');
-          displayContent = trimmedText ? `${trimmedText}\n\n${fileList}` : fileList;
-        }
-
-        onSendMessage(messageContent, displayContent);
-        setText('');
-        setAttachedFiles([]);
+      if (!trimmedText && attachedFiles.length === 0) {
+        return;
       }
+
+      let messageContent = trimmedText;
+
+      let displayContent = trimmedText;
+
+      /*
+       * Security:
+       *
+       * File contents are explicitly tagged so the background
+       * service can distinguish them from the user's instruction.
+       */
+      if (attachedFiles.length > 0) {
+        const fileContents = attachedFiles
+          .map(file => {
+            return (
+              `\n\n<nano_file_content type="file" name="${file.name}">\n` +
+              `${file.content}\n` +
+              `</nano_file_content>`
+            );
+          })
+          .join('\n');
+
+        messageContent = trimmedText
+          ? `${trimmedText}\n\n<nano_attached_files>${fileContents}</nano_attached_files>`
+          : `<nano_attached_files>${fileContents}</nano_attached_files>`;
+
+        /*
+         * Only show filenames in the chat display.
+         * The actual file contents remain in messageContent.
+         */
+        const fileList = attachedFiles
+          .map(file => `📎 ${file.name}`)
+          .join('\n');
+
+        displayContent = trimmedText
+          ? `${trimmedText}\n\n${fileList}`
+          : fileList;
+      }
+
+      /*
+       * Normal typed-message path.
+       *
+       * Voice recognition will also eventually call
+       * this same callback through SidePanel's
+       * handleSendMessage function.
+       */
+      onSendMessage(messageContent, displayContent);
+
+      setText('');
+
+      setAttachedFiles([]);
+
+      /*
+       * Reset the textarea height after sending.
+       */
+      window.requestAnimationFrame(() => {
+        resizeTextarea();
+      });
     },
-    [text, attachedFiles, onSendMessage],
+    [text, attachedFiles, onSendMessage, resizeTextarea],
   );
 
+  /*
+   * Enter sends the message.
+   *
+   * Shift + Enter creates a new line.
+   */
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (
+        e.key === 'Enter' &&
+        !e.shiftKey &&
+        !e.nativeEvent.isComposing
+      ) {
         e.preventDefault();
+
         handleSubmit(e);
       }
     },
     [handleSubmit],
   );
 
+  /*
+   * Replay a historical session.
+   */
   const handleReplay = useCallback(() => {
-    if (historicalSessionId && onReplay) {
-      onReplay(historicalSessionId);
+    if (!historicalSessionId || !onReplay) {
+      return;
     }
+
+    onReplay(historicalSessionId);
   }, [historicalSessionId, onReplay]);
 
+  /*
+   * Open the file picker.
+   */
   const handleFileSelect = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
 
-  const handleFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
+  /*
+   * Read selected text-based files.
+   */
+  const handleFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
 
-    const newFiles: AttachedFile[] = [];
-    const allowedTypes = ['.txt', '.md', '.markdown', '.json', '.csv', '.log', '.xml', '.yaml', '.yml'];
-
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      const fileExt = '.' + file.name.split('.').pop()?.toLowerCase();
-
-      // Check if file type is allowed
-      if (!allowedTypes.includes(fileExt)) {
-        console.warn(`File type ${fileExt} not supported. Only text-based files are allowed.`);
-        continue;
+      if (!files || files.length === 0) {
+        return;
       }
 
-      // Check file size (limit to 1MB)
-      if (file.size > 1024 * 1024) {
-        console.warn(`File ${file.name} is too large. Maximum size is 1MB.`);
-        continue;
+      const newFiles: AttachedFile[] = [];
+
+      const allowedTypes = [
+        '.txt',
+        '.md',
+        '.markdown',
+        '.json',
+        '.csv',
+        '.log',
+        '.xml',
+        '.yaml',
+        '.yml',
+      ];
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+
+        const fileExt =
+          '.' +
+          file.name
+            .split('.')
+            .pop()
+            ?.toLowerCase();
+
+        /*
+         * Only allow text-oriented files.
+         */
+        if (!allowedTypes.includes(fileExt)) {
+          console.warn(
+            `File type ${fileExt} not supported. ` +
+              `Only text-based files are allowed.`,
+          );
+
+          continue;
+        }
+
+        /*
+         * Maximum file size: 1 MB.
+         */
+        if (file.size > 1024 * 1024) {
+          console.warn(
+            `File ${file.name} is too large. ` +
+              `Maximum size is 1MB.`,
+          );
+
+          continue;
+        }
+
+        try {
+          const content = await file.text();
+
+          newFiles.push({
+            name: file.name,
+            content,
+            type: file.type || 'text/plain',
+          });
+        } catch (error) {
+          console.error(
+            `Error reading file ${file.name}:`,
+            error,
+          );
+        }
       }
 
-      try {
-        const content = await file.text();
-        newFiles.push({
-          name: file.name,
-          content,
-          type: file.type || 'text/plain',
-        });
-      } catch (error) {
-        console.error(`Error reading file ${file.name}:`, error);
+      if (newFiles.length > 0) {
+        setAttachedFiles(previousFiles => [
+          ...previousFiles,
+          ...newFiles,
+        ]);
       }
-    }
 
-    if (newFiles.length > 0) {
-      setAttachedFiles(prev => [...prev, ...newFiles]);
-    }
+      /*
+       * Reset input so selecting the same file again
+       * will trigger onChange.
+       */
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    },
+    [],
+  );
 
-    // Reset file input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
-  }, []);
-
+  /*
+   * Remove one attachment.
+   */
   const handleRemoveFile = useCallback((index: number) => {
-    setAttachedFiles(prev => prev.filter((_, i) => i !== index));
+    setAttachedFiles(previousFiles =>
+      previousFiles.filter((_, i) => i !== index),
+    );
   }, []);
+
+  /*
+   * Voice button is intentionally NOT disabled while
+   * NanoBrowser is processing a task.
+   *
+   * This is important because the user requested:
+   *
+   *     microphone ON
+   *     ↓
+   *     task executes
+   *     ↓
+   *     microphone remains ON
+   *
+   * The button must therefore remain clickable so the
+   * user can manually turn voice mode OFF.
+   */
+  const microphoneDisabled = false;
 
   return (
     <form
       onSubmit={handleSubmit}
-      className={`overflow-hidden rounded-lg border transition-colors ${disabled ? 'cursor-not-allowed' : 'focus-within:border-sky-400 hover:border-sky-400'} ${isDarkMode ? 'border-slate-700' : ''}`}
+      className={`overflow-hidden rounded-lg border transition-colors ${
+        disabled
+          ? 'cursor-not-allowed'
+          : 'focus-within:border-sky-400 hover:border-sky-400'
+      } ${
+        isDarkMode
+          ? 'border-slate-700'
+          : 'border-gray-200'
+      }`}
       aria-label={t('chat_input_form')}>
       <div className="flex flex-col">
-        {/* File attachments display */}
+        {/* ====================================================== */}
+        {/* File attachments                                      */}
+        {/* ====================================================== */}
+
         {attachedFiles.length > 0 && (
           <div
             className={`flex flex-wrap gap-2 border-b p-2 ${
-              isDarkMode ? 'border-slate-700 bg-slate-800' : 'border-gray-200 bg-gray-50'
+              isDarkMode
+                ? 'border-slate-700 bg-slate-800'
+                : 'border-gray-200 bg-gray-50'
             }`}>
             {attachedFiles.map((file, index) => (
               <div
-                key={index}
+                key={`${file.name}-${index}`}
                 className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs ${
-                  isDarkMode ? 'bg-slate-700 text-gray-300' : 'bg-gray-200 text-gray-700'
+                  isDarkMode
+                    ? 'bg-slate-700 text-gray-300'
+                    : 'bg-gray-200 text-gray-700'
                 }`}>
-                <span className="text-xs">📎</span>
-                <span className="max-w-[150px] truncate">{file.name}</span>
+                <span className="text-xs">
+                  📎
+                </span>
+
+                <span className="max-w-[150px] truncate">
+                  {file.name}
+                </span>
+
                 <button
                   type="button"
-                  onClick={() => handleRemoveFile(index)}
+                  onClick={() =>
+                    handleRemoveFile(index)
+                  }
                   className={`ml-1 rounded-sm transition-colors ${
-                    isDarkMode ? 'hover:bg-slate-600' : 'hover:bg-gray-300'
+                    isDarkMode
+                      ? 'hover:bg-slate-600'
+                      : 'hover:bg-gray-300'
                   }`}
                   aria-label={`Remove ${file.name}`}>
-                  <span className="text-xs">✕</span>
+                  <span className="text-xs">
+                    ✕
+                  </span>
                 </button>
               </div>
             ))}
           </div>
         )}
+
+        {/* ====================================================== */}
+        {/* Text input                                             */}
+        {/* ====================================================== */}
 
         <textarea
           ref={textareaRef}
@@ -231,18 +440,35 @@ export default function ChatInput({
                 : 'cursor-not-allowed bg-gray-100 text-gray-500'
               : isDarkMode
                 ? 'bg-slate-800 text-gray-200'
-                : 'bg-white'
+                : 'bg-white text-gray-900'
           }`}
-          placeholder={attachedFiles.length > 0 ? 'Add a message (optional)...' : t('chat_input_placeholder')}
+          placeholder={
+            attachedFiles.length > 0
+              ? 'Add a message (optional)...'
+              : t('chat_input_placeholder')
+          }
           aria-label={t('chat_input_editor')}
         />
 
+        {/* ====================================================== */}
+        {/* Bottom toolbar                                         */}
+        {/* ====================================================== */}
+
         <div
           className={`flex items-center justify-between px-2 py-1.5 ${
-            disabled ? (isDarkMode ? 'bg-slate-800' : 'bg-gray-100') : isDarkMode ? 'bg-slate-800' : 'bg-white'
+            disabled
+              ? isDarkMode
+                ? 'bg-slate-800'
+                : 'bg-gray-100'
+              : isDarkMode
+                ? 'bg-slate-800'
+                : 'bg-white'
           }`}>
-          <div className="flex gap-2 text-gray-500">
-            {/* File attachment button */}
+          <div className="flex items-center gap-2 text-gray-500">
+            {/* ================================================== */}
+            {/* File attachment button                            */}
+            {/* ================================================== */}
+
             <button
               type="button"
               onClick={handleFileSelect}
@@ -256,7 +482,9 @@ export default function ChatInput({
                     ? 'text-gray-400 hover:bg-slate-700 hover:text-gray-200'
                     : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'
               }`}>
-              <span className="text-lg">📎</span>
+              <span className="text-lg">
+                📎
+              </span>
             </button>
 
             {/* Hidden file input */}
@@ -270,41 +498,173 @@ export default function ChatInput({
               aria-hidden="true"
             />
 
+            {/* ================================================== */}
+            {/* ALWAYS-LISTENING MICROPHONE                       */}
+            {/* ================================================== */}
+
             {onMicClick && (
               <button
                 type="button"
                 onClick={onMicClick}
-                disabled={disabled || isProcessingSpeech}
+                disabled={microphoneDisabled}
                 aria-label={
-                  isProcessingSpeech
-                    ? t('chat_stt_processing')
-                    : isRecording
-                      ? t('chat_stt_recording_stop')
-                      : t('chat_stt_input_start')
+                  isRecording
+                    ? 'إيقاف الاستماع الصوتي'
+                    : 'تشغيل الاستماع الصوتي'
                 }
-                className={`rounded-md p-1.5 transition-colors ${
-                  disabled || isProcessingSpeech
-                    ? 'cursor-not-allowed opacity-50'
-                    : isRecording
-                      ? 'bg-red-500 text-white hover:bg-red-600'
+                aria-pressed={isRecording}
+                title={
+                  isRecording
+                    ? 'إيقاف الاستماع'
+                    : 'تشغيل الاستماع'
+                }
+                className={`
+                  relative
+                  flex
+                  items-center
+                  justify-center
+                  rounded-full
+                  p-3
+                  transition-all
+                  duration-200
+                  focus:outline-none
+                  focus:ring-2
+                  focus:ring-sky-400
+                  focus:ring-offset-1
+                  ${
+                    isRecording
+                      ? 'bg-red-500 text-white shadow-lg shadow-red-500/40 hover:bg-red-600'
                       : isDarkMode
-                        ? 'text-gray-400 hover:bg-slate-700 hover:text-gray-200'
-                        : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'
-                }`}>
-                {isProcessingSpeech ? (
-                  <AiOutlineLoading3Quarters className="size-4 animate-spin" />
-                ) : (
-                  <FaMicrophone className={`size-4 ${isRecording ? 'animate-pulse' : ''}`} />
+                        ? 'bg-slate-700 text-gray-300 hover:bg-slate-600 hover:text-white'
+                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200 hover:text-gray-900'
+                  }
+                `}
+                style={{
+                  minWidth: '48px',
+                  minHeight: '48px',
+                }}>
+                {/* Animated outer ring while listening */}
+                {isRecording && (
+                  <>
+                    <span
+                      className="
+                        absolute
+                        inset-0
+                        rounded-full
+                        animate-ping
+                        bg-red-500
+                        opacity-20
+                      "
+                    />
+
+                    <span
+                      className="
+                        absolute
+                        inset-[-3px]
+                        rounded-full
+                        border-2
+                        border-red-400
+                        opacity-70
+                      "
+                    />
+                  </>
                 )}
+
+                {/* Microphone icon */}
+                <FaMicrophone
+                  className={`
+                    relative
+                    z-10
+                    size-6
+                    ${
+                      isRecording
+                        ? 'animate-pulse'
+                        : ''
+                    }
+                  `}
+                />
               </button>
             )}
+
+            {/* ================================================== */}
+            {/* Listening status                                   */}
+            {/* ================================================== */}
+
+            {isRecording && (
+              <div
+                className="
+                  flex
+                  items-center
+                  gap-1.5
+                  text-xs
+                  font-medium
+                  text-red-500
+                  select-none
+                "
+                aria-live="polite">
+                <span
+                  className="
+                    size-2
+                    rounded-full
+                    bg-red-500
+                    animate-pulse
+                  "
+                />
+
+                <span>
+                  Listening...
+                </span>
+              </div>
+            )}
+
+            {/* ================================================== */}
+            {/* Compatibility status                              */}
+            {/* ================================================== */}
+
+            {isProcessingSpeech && !isRecording && (
+              <div
+                className="
+                  flex
+                  items-center
+                  gap-1.5
+                  text-xs
+                  text-gray-500
+                  select-none
+                "
+                aria-live="polite">
+                <span
+                  className="
+                    size-2
+                    rounded-full
+                    bg-yellow-400
+                    animate-pulse
+                  "
+                />
+
+                <span>
+                  Processing...
+                </span>
+              </div>
+            )}
           </div>
+
+          {/* ==================================================== */}
+          {/* Right side buttons                                   */}
+          {/* ==================================================== */}
 
           {showStopButton ? (
             <button
               type="button"
               onClick={onStopTask}
-              className="rounded-md bg-red-500 px-3 py-1 text-white transition-colors hover:bg-red-600">
+              className="
+                rounded-md
+                bg-red-500
+                px-3
+                py-1
+                text-white
+                transition-colors
+                hover:bg-red-600
+              ">
               {t('chat_buttons_stop')}
             </button>
           ) : historicalSessionId ? (
@@ -313,7 +673,20 @@ export default function ChatInput({
               onClick={handleReplay}
               disabled={!historicalSessionId}
               aria-disabled={!historicalSessionId}
-              className={`rounded-md bg-green-500 px-3 py-1 text-white transition-colors hover:enabled:bg-green-600 ${!historicalSessionId ? 'cursor-not-allowed opacity-50' : ''}`}>
+              className={`
+                rounded-md
+                bg-green-500
+                px-3
+                py-1
+                text-white
+                transition-colors
+                hover:enabled:bg-green-600
+                ${
+                  !historicalSessionId
+                    ? 'cursor-not-allowed opacity-50'
+                    : ''
+                }
+              `}>
               {t('chat_buttons_replay')}
             </button>
           ) : (
@@ -321,7 +694,20 @@ export default function ChatInput({
               type="submit"
               disabled={isSendButtonDisabled}
               aria-disabled={isSendButtonDisabled}
-              className={`rounded-md bg-[#19C2FF] px-3 py-1 text-white transition-colors hover:enabled:bg-[#0073DC] ${isSendButtonDisabled ? 'cursor-not-allowed opacity-50' : ''}`}>
+              className={`
+                rounded-md
+                bg-[#19C2FF]
+                px-3
+                py-1
+                text-white
+                transition-colors
+                hover:enabled:bg-[#0073DC]
+                ${
+                  isSendButtonDisabled
+                    ? 'cursor-not-allowed opacity-50'
+                    : ''
+                }
+              `}>
               {t('chat_buttons_send')}
             </button>
           )}
